@@ -1,0 +1,150 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// Shop-specific settings for multi-tenant support
+model ShopSettings {
+  id                      String   @id @default(cuid())
+  shop                    String   @unique // Shopify shop domain (e.g., mystore.myshopify.com)
+
+  // SKU Generation Settings
+  skuPrefix               String   @default("TT")
+  skuLength               Int      @default(8)
+  skuType                 String   @default("numeric") // "numeric" | "alphanumeric"
+  useSeparator            Boolean  @default(true)
+
+  // Auto-generation toggles
+  autoGenerateForProducts Boolean  @default(true)
+  autoGenerateForVariants Boolean  @default(true)
+  onlyWhenEmpty           Boolean  @default(true)
+
+  // App State
+  isActive                Boolean  @default(true)
+
+  // Timestamps
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  // Relations
+  skuHistory              SkuHistory[]
+
+  @@index([shop])
+}
+
+// SKU Generation History - track generated SKUs per shop
+model SkuHistory {
+  id          String   @id @default(cuid())
+  shop        String
+
+  // Generated SKU info
+  sku         String
+  productId   String?
+  variantId   String
+  productTitle String?
+
+  // Generation context
+  generatedAt DateTime @default(now())
+  generatedBy String   @default("webhook") // "webhook" | "manual" | "api"
+
+  // Relations
+  shopSettings ShopSettings @relation(fields: [shop], references: [shop], onDelete: Cascade)
+
+  @@index([shop])
+  @@index([sku])
+  @@index([generatedAt])
+}
+
+// App-level configuration (global settings, not shop-specific)
+model AppConfig {
+  id          String   @id @default("global")
+
+  // App metadata
+  appVersion  String   @default("1.0.0")
+
+  // Feature flags (can be overridden per shop if needed)
+  features    String?  // JSON string for extensibility
+
+  // Rate limiting / quotas
+  maxShops    Int      @default(0) // 0 = unlimited
+
+  updatedAt   DateTime @updatedAt
+}
+
+// Debug logs for troubleshooting
+model DebugLog {
+  id        String   @id @default(cuid())
+  shop      String
+  level     String   @default("info") // "info" | "warn" | "error"
+  source    String   // "webhook-products-create" | "webhook-products-update" | "settings"
+  message   String
+  details   String?  // JSON string for additional data
+  createdAt DateTime @default(now())
+
+  @@index([shop])
+  @@index([createdAt])
+  @@index([source])
+}
+
+// Location configurations for per-location stock tracking
+model LocationConfig {
+  id                    String   @id @default(cuid())
+  shop                  String
+  locationId            String
+  locationName          String
+  metafieldKey          String?  // e.g. "shop_location" (sanitized from locationName)
+  metafieldDefinitionId String?  // Shopify MetafieldDefinition GID
+  isActive              Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([shop, locationId])
+  @@index([shop])
+}
+
+// Smart Collection rule configurations based on location stock
+model CollectionRuleConfig {
+  id             String   @id @default(cuid())
+  shop           String
+  collectionId   String   // Shopify Collection GID
+  collectionName String
+  logicType      String   @default("AND") // "AND" | "OR"
+  threshold      Int      @default(1)
+  locationIds    String   // JSON array of location IDs
+  isActive       Boolean  @default(true)
+  createdBy      String?  // User email who created this config
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([shop])
+}

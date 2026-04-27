@@ -1,0 +1,90 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "bbc21e1662c9fddb6298828e31a656ea"
+name = "TT Data Generate"
+application_url = "https://app.tantech.co.nz"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-01"
+
+  [[webhooks.subscriptions]]
+  topics = [ "products/create" ]
+  uri = "/webhooks/products/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "products/update" ]
+  uri = "/webhooks/products/update"
+
+  # Real-time per-location stock changes. Required for syncing inventory into
+  # product metafields used by smart collection rules.
+  [[webhooks.subscriptions]]
+  topics = [ "inventory_levels/update" ]
+  uri = "/webhooks/inventory-levels/update"
+
+  # Fires when an inventory item is stocked at a new location (e.g. merchant
+  # opens a new warehouse). Needed to keep per-location metafields complete.
+  [[webhooks.subscriptions]]
+  topics = [ "inventory_levels/connect" ]
+  uri = "/webhooks/inventory-levels/connect"
+
+  # Fires when an inventory item is removed from a location. Needed to clear
+  # stale per-location metafield entries.
+  [[webhooks.subscriptions]]
+  topics = [ "inventory_levels/disconnect" ]
+  uri = "/webhooks/inventory-levels/disconnect"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+[access_scopes]
+# write_products covers product, variant, collection (incl. smart collection
+# rules), and product-metafield read/write. read_inventory + read_locations
+# are required for per-location stock lookups (read_locations depends on
+# read_inventory or write_inventory). write_inventory is kept in case the app
+# adjusts stock; remove it if the app is read-only on inventory.
+# Note: there is no separate read_metafields/write_metafields scope in Shopify;
+# metafield access is granted via the owner-type scope (write_products here).
+scopes = "read_products,write_products,read_inventory,write_inventory,read_locations"
+
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [ "https://app.tantech.co.nz/auth/callback" ]
+
+# Optional demo metafield from Shopify template.
+# You can remove this if you are no longer using the template demo field.
+[product.metafields.app.demo_info]
+type = "single_line_text_field"
+name = "Demo Source Info"
+description = "Tracks products created by the Shopify app template for development"
+
+  [product.metafields.app.demo_info.access]
+  admin = "merchant_read_write"
+
+# Optional demo metaobject from Shopify template.
+# You can remove the whole metaobjects.app.example block if unused.
+[metaobjects.app.example]
+name = "Example"
+description = "An example metaobject definition created by this template"
+
+  [metaobjects.app.example.access]
+  admin = "merchant_read_write"
+
+[metaobjects.app.example.fields.title]
+name = "Title"
+type = "single_line_text_field"
+required = true
+
+[metaobjects.app.example.fields.description]
+name = "Description"
+type = "multi_line_text_field"
