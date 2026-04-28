@@ -106,6 +106,10 @@ export default function SmartCollectionPage() {
         { method: "POST" }
       );
     }
+    if (inventoryFetcher.data?.error) {
+      setMessage(`Inventory sync error: ${inventoryFetcher.data.error}`);
+      setTimeout(() => setMessage(""), 10000);
+    }
   }, [inventoryFetcher.data]);
 
   const handleStartInventorySync = () => {
@@ -376,7 +380,7 @@ export default function SmartCollectionPage() {
       <s-section heading="Inventory Sync">
         <s-stack direction="block" gap="base">
           <s-text color="subdued" fontSize="small">
-            Walks every product in the shop and writes current per-location stock into the metafields. Runs in the background — you can leave this page and come back; progress is persisted. The product counter reflects scan progress; the metafields counter reflects writes during the final phase.
+            Walks every product in the shop and writes current per-location stock into the metafields. Runs in the background — you can leave this page and come back; progress is persisted. Supports up to 20,000 products; larger catalogs will be blocked with a warning. The product counter reflects scan progress; the metafields counter reflects writes during the final phase.
           </s-text>
 
           <s-stack direction="inline" gap="base" alignment="center">
@@ -943,6 +947,14 @@ export const action = async ({ request }) => {
 
       const { admin } = await authenticate.admin(request);
       const totalProducts = await fetchProductsCount(admin);
+
+      const MAX_PRODUCTS = 20000;
+      if (totalProducts > MAX_PRODUCTS) {
+        return {
+          error: `Your shop has ${totalProducts.toLocaleString()} products, which exceeds the maximum supported limit of ${MAX_PRODUCTS.toLocaleString()}. Please contact support to sync large catalogs.`,
+          action: "startInventorySync",
+        };
+      }
 
       const job = await prisma.inventorySyncJob.create({
         data: { shop, status: "running", totalProducts },

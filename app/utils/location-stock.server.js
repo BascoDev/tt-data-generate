@@ -36,6 +36,15 @@ export async function fetchLocations(admin) {
     }`
   );
   const data = await response.json();
+  if (data.errors?.length > 0) {
+    const msg = data.errors.map((e) => e.message).join("; ");
+    // Most common cause in prod: missing read_locations scope on a stale
+    // access token. The app needs to be re-installed (or scopes re-granted)
+    // for the new scope to take effect.
+    throw new Error(
+      `Failed to fetch locations: ${msg}. If this mentions access or scopes, the app's access token is missing read_locations — reinstall or re-grant scopes for this shop.`
+    );
+  }
   return data.data?.locations?.edges?.map((edge) => edge.node) || [];
 }
 
@@ -219,13 +228,15 @@ async function writeProductLocationMetafield(admin, productGid, key, value) {
 }
 
 /**
- * Total product count for the shop. Used to render an accurate progress bar.
+ * Total product count for the shop. Pass `limit: null` to defeat Shopify's
+ * 10,000 default cap; otherwise large catalogs report a misleading total
+ * and the progress bar renders past 100%.
  */
 export async function fetchProductsCount(admin) {
   const resp = await admin.graphql(
     `#graphql
     query ProductsCount {
-      productsCount { count }
+      productsCount(limit: null) { count precision }
     }`
   );
   const data = await resp.json();

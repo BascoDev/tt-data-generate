@@ -138,6 +138,7 @@ model InventorySyncJob {
   id                String    @id @default(cuid())
   shop              String
   status            String    @default("running") // "running" | "completed" | "failed" | "cancelled"
+  phase             String    @default("enumerate") // "enumerate" | "scan" | "write" | "done"
   totalProducts     Int       @default(0)
   processedProducts Int       @default(0)
   metafieldsWritten Int       @default(0)
