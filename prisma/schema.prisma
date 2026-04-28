@@ -132,6 +132,25 @@ model LocationConfig {
   @@index([shop])
 }
 
+// Background inventory-sync job state. One row per shop's most recent run.
+// Frontend polls this row to draw the progress bar.
+model InventorySyncJob {
+  id                String    @id @default(cuid())
+  shop              String
+  status            String    @default("running") // "running" | "completed" | "failed" | "cancelled"
+  totalProducts     Int       @default(0)
+  processedProducts Int       @default(0)
+  metafieldsWritten Int       @default(0)
+  cursor            String?
+  errors            String    @default("[]")     // JSON array of error strings
+  startedAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  completedAt       DateTime?
+
+  @@index([shop])
+  @@index([status])
+}
+
 // Smart Collection rule configurations based on location stock
 model CollectionRuleConfig {
   id             String   @id @default(cuid())

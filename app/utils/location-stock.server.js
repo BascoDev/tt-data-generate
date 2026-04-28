@@ -125,18 +125,22 @@ export async function ensureLocationMetafieldDefinition(admin, locationId, locat
 export async function deleteLocationMetafieldDefinition(admin, metafieldDefinitionId) {
   if (!metafieldDefinitionId) return false;
 
+  // deleteAllAssociatedMetafields: true cascades the deletion to every
+  // product metafield using this definition. Without it, Shopify only
+  // removes the schema and leaves orphaned values on every product.
   const response = await admin.graphql(
     `#graphql
-    mutation DeleteMetafieldDefinition($id: ID!) {
-      metafieldDefinitionDelete(id: $id) {
+    mutation DeleteMetafieldDefinition($id: ID!, $deleteAllAssociatedMetafields: Boolean!) {
+      metafieldDefinitionDelete(id: $id, deleteAllAssociatedMetafields: $deleteAllAssociatedMetafields) {
         deletedDefinitionId
         userErrors {
           field
           message
+          code
         }
       }
     }`,
-    { variables: { id: metafieldDefinitionId } }
+    { variables: { id: metafieldDefinitionId, deleteAllAssociatedMetafields: true } }
   );
   const data = await response.json();
   if (data.data?.metafieldDefinitionDelete?.userErrors?.length > 0) {
@@ -215,122 +219,254 @@ async function writeProductLocationMetafield(admin, productGid, key, value) {
 }
 
 /**
- * Walk all products in the shop and refresh per-location stock metafields
- * for every active locationConfig. Use after a Sync Locations to backfill
- * historical inventory into the new metafields. Returns counters.
+ * Total product count for the shop. Used to render an accurate progress bar.
  */
-export async function fullInventorySync(admin, shop) {
+export async function fetchProductsCount(admin) {
+  const resp = await admin.graphql(
+    `#graphql
+    query ProductsCount {
+      productsCount { count }
+    }`
+  );
+  const data = await resp.json();
+  return data.data?.productsCount?.count ?? 0;
+}
+
+/**
+ * Walk every tracked location's inventory and refresh per-location stock
+ * metafields on every product. Uses location-driven pagination instead of
+ * nested products → variants → inventoryLevels, which keeps single-query
+ * cost well under Shopify's 1000-point budget.
+ *
+ * Two phases:
+ *   1. Scan: paginate `location.inventoryLevels` for each tracked location,
+ *      accumulate per-product totals into an in-memory map.
+ *   2. Write: emit metafieldsSet mutations, 25 entries per call.
+ *
+ * `onProgress({ productsScanned, metafieldsWritten, errors })` fires at every
+ * meaningful checkpoint so the polling UI can render progress.
+ * `shouldStop()` is checked between pages and between phases for cancellation.
+ */
+export async function fullInventorySync(admin, shop, { onProgress, shouldStop } = {}) {
   const locationConfigs = await prisma.locationConfig.findMany({
     where: { shop, isActive: true, metafieldDefinitionId: { not: null } },
   });
   if (locationConfigs.length === 0) {
-    return { productsScanned: 0, productsUpdated: 0, metafieldsWritten: 0 };
+    return { productsScanned: 0, metafieldsWritten: 0, errors: [] };
   }
 
-  const locationKeyByGid = new Map();
-  for (const lc of locationConfigs) {
-    if (lc.metafieldKey) {
-      locationKeyByGid.set(`gid://shopify/Location/${lc.locationId}`, lc.metafieldKey);
+  const errors = [];
+  let metafieldsWritten = 0;
+  // productGid -> Map(metafieldKey -> totalAvailable)
+  const productTotals = new Map();
+  const trackedKeys = locationConfigs.filter((lc) => lc.metafieldKey).map((lc) => lc.metafieldKey);
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const isStopped = async () => (shouldStop ? !!(await shouldStop()) : false);
+  const reportProgress = async () => {
+    if (!onProgress) return;
+    try {
+      await onProgress({
+        productsScanned: productTotals.size,
+        metafieldsWritten,
+        errors: [...errors],
+      });
+    } catch (_err) {
+      // swallow — progress reporting must never abort the sync
+    }
+  };
+
+  // --- Phase 0: enumerate every product so we can baseline 0 at each location.
+  // This guarantees products with no inventoryLevel at a location still get a
+  // 0 metafield (otherwise smart-collection rules using `<` would misbehave).
+  {
+    let cursor = null;
+    let hasNext = true;
+    while (hasNext) {
+      if (await isStopped()) return { productsScanned: productTotals.size, metafieldsWritten, errors, stopped: true };
+      let page = null;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          const resp = await admin.graphql(
+            `#graphql
+            query AllProductIds($cursor: String) {
+              products(first: 250, after: $cursor) {
+                edges { node { id } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }`,
+            { variables: { cursor } }
+          );
+          const data = await resp.json();
+          const throttled = data.errors?.some((e) => e.extensions?.code === "THROTTLED");
+          if (throttled) {
+            await sleep(1500 * (attempt + 1));
+            continue;
+          }
+          if (data.errors?.length > 0) {
+            errors.push(`Product enumeration: ${data.errors.map((e) => e.message).join(", ")}`);
+            break;
+          }
+          page = data.data?.products;
+          break;
+        } catch (err) {
+          if (attempt === 3) {
+            errors.push(`Product enumeration crashed: ${err.message}`);
+          } else {
+            await sleep(1500 * (attempt + 1));
+          }
+        }
+      }
+      if (!page) break;
+
+      for (const edge of page.edges) {
+        const id = edge.node.id;
+        if (!productTotals.has(id)) {
+          const m = new Map();
+          for (const k of trackedKeys) m.set(k, 0);
+          productTotals.set(id, m);
+        }
+      }
+      hasNext = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
+      await reportProgress();
     }
   }
 
-  let productsScanned = 0;
-  let productsUpdated = 0;
-  let metafieldsWritten = 0;
-  let cursor = null;
-  let hasNext = true;
+  // --- Phase 1: scan each location's inventoryLevels ------------------------
+  for (const lc of locationConfigs) {
+    if (!lc.metafieldKey) continue;
+    const locationGid = `gid://shopify/Location/${lc.locationId}`;
+    const key = lc.metafieldKey;
 
-  while (hasNext) {
-    const resp = await admin.graphql(
-      `#graphql
-      query ProductsWithInventory($cursor: String) {
-        products(first: 25, after: $cursor) {
-          edges {
-            node {
-              id
-              variants(first: 100) {
-                edges {
-                  node {
-                    inventoryItem {
-                      inventoryLevels(first: 50) {
-                        edges {
-                          node {
-                            location { id }
-                            quantities(names: ["available"]) { name quantity }
-                          }
+    let cursor = null;
+    let hasNext = true;
+    while (hasNext) {
+      if (await isStopped()) return { productsScanned: productTotals.size, metafieldsWritten, errors, stopped: true };
+
+      let page = null;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          const resp = await admin.graphql(
+            `#graphql
+            query LocationLevels($id: ID!, $cursor: String) {
+              location(id: $id) {
+                inventoryLevels(first: 100, after: $cursor) {
+                  edges {
+                    node {
+                      quantities(names: ["available"]) { name quantity }
+                      item {
+                        variant {
+                          product { id }
                         }
                       }
                     }
                   }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
-            }
+            }`,
+            { variables: { id: locationGid, cursor } }
+          );
+          const data = await resp.json();
+          const throttled = data.errors?.some((e) => e.extensions?.code === "THROTTLED");
+          if (throttled) {
+            await sleep(1500 * (attempt + 1));
+            continue;
           }
-          pageInfo { hasNextPage endCursor }
-        }
-      }`,
-      { variables: { cursor } }
-    );
-    const data = await resp.json();
-    const page = data.data?.products;
-    if (!page) break;
-
-    const batch = [];
-    for (const edge of page.edges) {
-      productsScanned += 1;
-      const product = edge.node;
-      const totals = new Map();
-      for (const gid of locationKeyByGid.keys()) totals.set(gid, 0);
-
-      for (const vEdge of product.variants.edges) {
-        const levels = vEdge.node.inventoryItem?.inventoryLevels?.edges || [];
-        for (const lEdge of levels) {
-          const locGid = lEdge.node.location?.id;
-          if (!totals.has(locGid)) continue;
-          const q = lEdge.node.quantities?.find((x) => x.name === "available")?.quantity || 0;
-          totals.set(locGid, totals.get(locGid) + q);
+          if (data.errors?.length > 0) {
+            errors.push(`location(${lc.locationName}) levels query: ${data.errors.map((e) => e.message).join(", ")}`);
+            break;
+          }
+          page = data.data?.location?.inventoryLevels;
+          break;
+        } catch (err) {
+          if (attempt === 3) {
+            errors.push(`location(${lc.locationName}) levels query crashed: ${err.message}`);
+          } else {
+            await sleep(1500 * (attempt + 1));
+          }
         }
       }
+      if (!page) break;
 
-      for (const [locGid, total] of totals) {
-        const key = locationKeyByGid.get(locGid);
-        if (!key) continue;
-        batch.push({
-          ownerId: product.id,
-          namespace: "custom",
-          key,
-          type: "number_integer",
-          value: String(total),
-        });
+      for (const edge of page.edges) {
+        const productId = edge.node.item?.variant?.product?.id;
+        if (!productId) continue;
+        const avail = edge.node.quantities?.find((q) => q.name === "available")?.quantity ?? 0;
+        let perLoc = productTotals.get(productId);
+        if (!perLoc) {
+          // Product appeared in inventory but wasn't in phase 0 (race or new
+          // product mid-sync). Initialize it on the fly.
+          perLoc = new Map();
+          for (const k of trackedKeys) perLoc.set(k, 0);
+          productTotals.set(productId, perLoc);
+        }
+        perLoc.set(key, (perLoc.get(key) || 0) + avail);
       }
-      productsUpdated += 1;
-    }
 
-    // metafieldsSet accepts up to 25 entries per call.
-    for (let i = 0; i < batch.length; i += 25) {
-      const chunk = batch.slice(i, i + 25);
-      const setResp = await admin.graphql(
-        `#graphql
-        mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
-          metafieldsSet(metafields: $metafields) {
-            userErrors { field message }
-          }
-        }`,
-        { variables: { metafields: chunk } }
-      );
-      const setData = await setResp.json();
-      const errs = setData.data?.metafieldsSet?.userErrors || [];
-      if (errs.length > 0) {
-        throw new Error(`metafieldsSet failed: ${errs.map((e) => e.message).join(", ")}`);
-      }
-      metafieldsWritten += chunk.length;
+      hasNext = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
+      await reportProgress();
     }
-
-    hasNext = page.pageInfo.hasNextPage;
-    cursor = page.pageInfo.endCursor;
   }
 
-  return { productsScanned, productsUpdated, metafieldsWritten };
+  // --- Phase 2: write metafields, batched ----------------------------------
+  if (await isStopped()) return { productsScanned: productTotals.size, metafieldsWritten, errors, stopped: true };
+
+  const allEntries = [];
+  for (const [productId, perLoc] of productTotals) {
+    for (const [key, total] of perLoc) {
+      allEntries.push({
+        ownerId: productId,
+        namespace: "custom",
+        key,
+        type: "number_integer",
+        value: String(total),
+      });
+    }
+  }
+
+  for (let i = 0; i < allEntries.length; i += 25) {
+    if (await isStopped()) return { productsScanned: productTotals.size, metafieldsWritten, errors, stopped: true };
+    const chunk = allEntries.slice(i, i + 25);
+    let chunkOk = false;
+    for (let attempt = 0; attempt < 4 && !chunkOk; attempt += 1) {
+      try {
+        const setResp = await admin.graphql(
+          `#graphql
+          mutation SetMetafields($metafields: [MetafieldsSetInput!]!) {
+            metafieldsSet(metafields: $metafields) {
+              userErrors { field message }
+            }
+          }`,
+          { variables: { metafields: chunk } }
+        );
+        const setData = await setResp.json();
+        const throttled = setData.errors?.some((e) => e.extensions?.code === "THROTTLED");
+        if (throttled) {
+          await sleep(1500 * (attempt + 1));
+          continue;
+        }
+        const errs = setData.data?.metafieldsSet?.userErrors || [];
+        if (errs.length > 0) {
+          errors.push(`metafieldsSet chunk: ${errs.map((e) => e.message).join(", ")}`);
+          break;
+        }
+        metafieldsWritten += chunk.length;
+        chunkOk = true;
+      } catch (err) {
+        if (attempt === 3) {
+          errors.push(`metafieldsSet crashed: ${err.message}`);
+        } else {
+          await sleep(1500 * (attempt + 1));
+        }
+      }
+    }
+    await reportProgress();
+  }
+
+  return { productsScanned: productTotals.size, metafieldsWritten, errors };
 }
 
 /**
@@ -353,6 +489,11 @@ export async function fetchSmartCollections(admin) {
                   column
                   relation
                   condition
+                  conditionObject {
+                    ... on CollectionRuleMetafieldCondition {
+                      metafieldDefinition { id }
+                    }
+                  }
                 }
               }
             }
@@ -363,6 +504,40 @@ export async function fetchSmartCollections(admin) {
   );
   const data = await response.json();
   return data.data?.collections?.edges?.map((edge) => edge.node) || [];
+}
+
+/**
+ * Fetch a single collection's ruleSet with conditionObject populated.
+ * Used right before append to avoid race-stale data.
+ */
+export async function fetchCollectionRuleSet(admin, collectionId) {
+  const response = await admin.graphql(
+    `#graphql
+    query GetCollectionRuleSet($id: ID!) {
+      collection(id: $id) {
+        id
+        title
+        ... on Collection {
+          ruleSet {
+            appliedDisjunctively
+            rules {
+              column
+              relation
+              condition
+              conditionObject {
+                ... on CollectionRuleMetafieldCondition {
+                  metafieldDefinition { id }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { variables: { id: collectionId } }
+  );
+  const data = await response.json();
+  return data.data?.collection || null;
 }
 
 /**

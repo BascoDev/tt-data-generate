@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(shopify app *)"
+      "Bash(shopify app *)",
+      "mcp__shopify-dev-mcp__learn_shopify_api",
+      "mcp__shopify-dev-mcp__search_docs_chunks"
     ]
   }
 }

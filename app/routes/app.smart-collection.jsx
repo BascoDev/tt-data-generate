@@ -5,13 +5,16 @@ import prisma from "../db.server";
 import {
   fetchLocations,
   fetchSmartCollections,
+  fetchCollectionRuleSet,
   buildCollectionRules,
   updateCollectionRules,
   ensureLocationMetafieldDefinition,
   deleteLocationMetafieldDefinition,
   sanitizeLocationName,
   fullInventorySync,
+  fetchProductsCount,
 } from "../utils/location-stock.server";
+import { unauthenticated } from "../shopify.server";
 import { logDebug, logError } from "../utils/logger.server";
 
 export const loader = async ({ request }) => {
@@ -30,7 +33,12 @@ export const loader = async ({ request }) => {
       orderBy: { createdAt: "asc" },
     });
 
-    return { locationConfigs, collections: [], savedConfigs, shop, error: null };
+    const inventoryJob = await prisma.inventorySyncJob.findFirst({
+      where: { shop },
+      orderBy: { startedAt: "desc" },
+    });
+
+    return { locationConfigs, collections: [], savedConfigs, shop, inventoryJob, error: null };
   } catch (error) {
     console.error("[SmartCollection Loader] Error:", error);
     return {
@@ -38,19 +46,22 @@ export const loader = async ({ request }) => {
       collections: [],
       savedConfigs: [],
       shop,
+      inventoryJob: null,
       error: error.message,
     };
   }
 };
 
 export default function SmartCollectionPage() {
-  const { locationConfigs, savedConfigs, shop, error: loaderError } = useLoaderData();
+  const { locationConfigs, savedConfigs, shop, inventoryJob: initialJob, error: loaderError } = useLoaderData();
   const fetcher = useFetcher();
+  const inventoryFetcher = useFetcher();
   const revalidator = useRevalidator();
   const [message, setMessage] = useState(loaderError || "");
   const [syncResult, setSyncResult] = useState(null);
   const [localCollections, setLocalCollections] = useState([]);
   const [saveError, setSaveError] = useState("");
+  const [inventoryJob, setInventoryJob] = useState(initialJob || null);
 
   const [selectedCollections, setSelectedCollections] = useState([]);
   const [selectedLocations, setSelectedLocations] = useState([]);
@@ -62,6 +73,61 @@ export default function SmartCollectionPage() {
   const isSubmitting = fetcher.state === "submitting";
   const currentAction = fetcher.formData?.get("action");
 
+  const isJobRunning = inventoryJob?.status === "running";
+
+  // Poll job status every 2s while running.
+  useEffect(() => {
+    if (!isJobRunning) return;
+    const tick = () => {
+      inventoryFetcher.submit(
+        { action: "getInventorySyncStatus", shop },
+        { method: "POST" }
+      );
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, [isJobRunning, shop]);
+
+  useEffect(() => {
+    if (inventoryFetcher.data?.success && inventoryFetcher.data.job) {
+      setInventoryJob(inventoryFetcher.data.job);
+    }
+    if (inventoryFetcher.data?.success && inventoryFetcher.data.jobStarted) {
+      // Force an immediate status fetch to start polling loop with fresh row.
+      inventoryFetcher.submit(
+        { action: "getInventorySyncStatus", shop },
+        { method: "POST" }
+      );
+    }
+    if (inventoryFetcher.data?.success && inventoryFetcher.data.cancelled) {
+      inventoryFetcher.submit(
+        { action: "getInventorySyncStatus", shop },
+        { method: "POST" }
+      );
+    }
+  }, [inventoryFetcher.data]);
+
+  const handleStartInventorySync = () => {
+    inventoryFetcher.submit(
+      { action: "startInventorySync", shop },
+      { method: "POST" }
+    );
+  };
+
+  const handleCancelInventorySync = () => {
+    if (confirm("Cancel the running inventory sync?")) {
+      inventoryFetcher.submit(
+        { action: "cancelInventorySync", shop },
+        { method: "POST" }
+      );
+    }
+  };
+
+  const inventoryProgressPct = inventoryJob && inventoryJob.totalProducts > 0
+    ? Math.min(100, Math.round((inventoryJob.processedProducts / inventoryJob.totalProducts) * 100))
+    : 0;
+
   useEffect(() => {
     if (fetcher.data?.success) {
       if (fetcher.data?.synced) {
@@ -69,12 +135,8 @@ export default function SmartCollectionPage() {
           added: fetcher.data.added || [],
           removed: fetcher.data.removed || [],
         });
-        const inv = fetcher.data.inventorySync;
-        const invMsg = inv
-          ? ` Inventory backfilled for ${inv.productsScanned} products (${inv.metafieldsWritten} metafields written).`
-          : "";
-        setMessage(`Locations synced: ${fetcher.data.added?.length || 0} added, ${fetcher.data.removed?.length || 0} removed.${invMsg}`);
-        setTimeout(() => setMessage(""), 8000);
+        setMessage(`Locations synced: ${fetcher.data.added?.length || 0} added, ${fetcher.data.removed?.length || 0} removed. Click "Start Inventory Sync" below to backfill stock values.`);
+        setTimeout(() => setMessage(""), 10000);
       } else if (fetcher.data?.syncedCollections) {
         setLocalCollections(fetcher.data.collections || []);
         setMessage(`Collections synced: ${fetcher.data.collections?.length || 0} smart collections loaded.`);
@@ -194,6 +256,45 @@ export default function SmartCollectionPage() {
         </s-box>
       )}
 
+      {/* Tutorial / How it works */}
+      <s-section heading="How it works">
+        <s-stack direction="block" gap="small">
+          <s-text>
+            This tool maintains per-location stock metafields on every product, then appends those metafields as rules to your existing smart collections.
+          </s-text>
+          <s-stack direction="block" gap="extra-tight">
+            <s-text fontWeight="bold" fontSize="small">Step 1 — Sync Locations</s-text>
+            <s-text color="subdued" fontSize="small">
+              Click <s-text fontWeight="bold">Sync Locations</s-text> to create a metafield definition per location. Run again whenever you add/remove a location in Shopify.
+            </s-text>
+          </s-stack>
+          <s-stack direction="block" gap="extra-tight">
+            <s-text fontWeight="bold" fontSize="small">Step 2 — Inventory Sync</s-text>
+            <s-text color="subdued" fontSize="small">
+              Click <s-text fontWeight="bold">Start Inventory Sync</s-text> to walk every product and write current per-location stock into the metafields. Runs in the background — you can leave the page; progress persists. Run after Step 1 and any time you suspect drift.
+            </s-text>
+          </s-stack>
+          <s-stack direction="block" gap="extra-tight">
+            <s-text fontWeight="bold" fontSize="small">Step 3 — Sync Collections</s-text>
+            <s-text color="subdued" fontSize="small">
+              Click <s-text fontWeight="bold">Sync Collections</s-text> to load your existing smart collections. This tool only modifies smart collections — it does not create new ones.
+            </s-text>
+          </s-stack>
+          <s-stack direction="block" gap="extra-tight">
+            <s-text fontWeight="bold" fontSize="small">Step 4 — Pick collections, locations, logic</s-text>
+            <s-text color="subdued" fontSize="small">
+              Choose one or more smart collections, the locations whose stock should drive membership, the logic (AND = all locations / OR = any location), and a stock threshold. New rules are <s-text fontWeight="bold">appended</s-text> to existing rules; rules already present for the same location are skipped automatically.
+            </s-text>
+          </s-stack>
+          <s-stack direction="block" gap="extra-tight">
+            <s-text fontWeight="bold" fontSize="small">Note on logic compatibility</s-text>
+            <s-text color="subdued" fontSize="small">
+              A smart collection can only use one logic type at a time. If a collection already has rules using AND, you can only append AND rules to it (and vice versa). Change the logic in Shopify Admin first if needed.
+            </s-text>
+          </s-stack>
+        </s-stack>
+      </s-section>
+
       {/* Shop Locations */}
       <s-section heading="Shop Locations">
         <s-stack direction="block" gap="base">
@@ -206,7 +307,7 @@ export default function SmartCollectionPage() {
               Sync Locations
             </s-button>
             <s-text color="subdued" fontSize="small">
-              Sync all locations and backfill inventory metafields.
+              Sync location list and create metafield definitions. Inventory values are filled via the Inventory Sync section below.
             </s-text>
           </s-stack>
 
@@ -269,6 +370,106 @@ export default function SmartCollectionPage() {
             </s-unordered-list>
           </s-box>
         )}
+      </s-section>
+
+      {/* Inventory Sync (manual, background) */}
+      <s-section heading="Inventory Sync">
+        <s-stack direction="block" gap="base">
+          <s-text color="subdued" fontSize="small">
+            Walks every product in the shop and writes current per-location stock into the metafields. Runs in the background — you can leave this page and come back; progress is persisted. The product counter reflects scan progress; the metafields counter reflects writes during the final phase.
+          </s-text>
+
+          <s-stack direction="inline" gap="base" alignment="center">
+            <s-button
+              variant="primary"
+              onClick={handleStartInventorySync}
+              disabled={isJobRunning || activeLocations.length === 0}
+              loading={inventoryFetcher.state === "submitting" && inventoryFetcher.formData?.get("action") === "startInventorySync"}
+            >
+              Start Inventory Sync
+            </s-button>
+            {isJobRunning && (
+              <s-button
+                variant="tertiary"
+                tone="critical"
+                onClick={handleCancelInventorySync}
+                loading={inventoryFetcher.state === "submitting" && inventoryFetcher.formData?.get("action") === "cancelInventorySync"}
+              >
+                Cancel
+              </s-button>
+            )}
+            {activeLocations.length === 0 && (
+              <s-text color="subdued" fontSize="small">Sync locations first.</s-text>
+            )}
+          </s-stack>
+
+          {inventoryJob && (
+            <s-box padding="base" borderRadius="base" borderWidth="base">
+              <s-stack direction="block" gap="small">
+                <s-stack direction="inline" gap="base" alignment="center">
+                  <s-badge tone={
+                    inventoryJob.status === "running" ? "info"
+                    : inventoryJob.status === "completed" ? "success"
+                    : inventoryJob.status === "cancelled" ? "warning"
+                    : "critical"
+                  }>
+                    {inventoryJob.status}
+                  </s-badge>
+                  <s-text fontSize="small">
+                    {inventoryJob.processedProducts} / {inventoryJob.totalProducts || "?"} products
+                  </s-text>
+                  <s-text color="subdued" fontSize="small">
+                    {inventoryJob.metafieldsWritten} metafields written
+                  </s-text>
+                </s-stack>
+
+                {inventoryJob.totalProducts > 0 && (
+                  <s-progress-indicator
+                    progress={inventoryProgressPct}
+                    accessibilityLabel={`Inventory sync ${inventoryProgressPct}%`}
+                  />
+                )}
+
+                <s-stack direction="inline" gap="base" alignment="center">
+                  <s-text color="subdued" fontSize="small">
+                    Started: {new Date(inventoryJob.startedAt).toLocaleString()}
+                  </s-text>
+                  {inventoryJob.completedAt && (
+                    <s-text color="subdued" fontSize="small">
+                      Finished: {new Date(inventoryJob.completedAt).toLocaleString()}
+                    </s-text>
+                  )}
+                </s-stack>
+
+                {(() => {
+                  const errs = (() => {
+                    try { return JSON.parse(inventoryJob.errors || "[]"); } catch { return []; }
+                  })();
+                  if (errs.length === 0) return null;
+                  return (
+                    <s-box padding="tight" borderRadius="base" background="critical-subdued">
+                      <s-text fontWeight="bold" color="critical" fontSize="small">
+                        {errs.length} error(s):
+                      </s-text>
+                      <s-unordered-list>
+                        {errs.slice(0, 5).map((e, i) => (
+                          <s-list-item key={i}>
+                            <s-text fontSize="small">{e}</s-text>
+                          </s-list-item>
+                        ))}
+                      </s-unordered-list>
+                      {errs.length > 5 && (
+                        <s-text color="subdued" fontSize="small">
+                          ...and {errs.length - 5} more
+                        </s-text>
+                      )}
+                    </s-box>
+                  );
+                })()}
+              </s-stack>
+            </s-box>
+          )}
+        </s-stack>
       </s-section>
 
       {/* Create Collection Rule */}
@@ -485,35 +686,11 @@ export const action = async ({ request }) => {
       const appliedDisjunctively = logicType === "OR";
       const newRules = buildCollectionRules(locationConfigs, threshold);
 
-      console.log("[Save] Selected locationConfigs:", JSON.stringify(locationConfigs.map((l) => ({ name: l.locationName, defId: l.metafieldDefinitionId }))));
-      console.log("[Save] Built newRules:", JSON.stringify(newRules));
-
       const results = [];
       const errors = [];
 
       for (const collectionId of collectionIds) {
-        const collectionResponse = await admin.graphql(
-          `#graphql
-          query GetCollection($id: ID!) {
-            collection(id: $id) {
-              id
-              title
-              ... on Collection {
-                ruleSet {
-                  appliedDisjunctively
-                  rules {
-                    column
-                    relation
-                    condition
-                  }
-                }
-              }
-            }
-          }`,
-          { variables: { id: collectionId } }
-        );
-        const collectionData = await collectionResponse.json();
-        const collection = collectionData.data?.collection;
+        const collection = await fetchCollectionRuleSet(admin, collectionId);
         const collectionName = collection?.title || "Unnamed";
 
         if (!collection?.ruleSet) {
@@ -524,87 +701,72 @@ export const action = async ({ request }) => {
         const existingRules = collection.ruleSet.rules || [];
         const existingAppliedDisjunctively = collection.ruleSet.appliedDisjunctively ?? false;
 
+        // Enforce logic compatibility against existing rules (any column).
         if (existingRules.length > 0 && existingAppliedDisjunctively !== appliedDisjunctively) {
           errors.push(
-            `Collection "${collectionName}" already uses ${existingAppliedDisjunctively ? "OR" : "AND"} logic. Cannot append ${logicType} rules.`
+            `Collection "${collectionName}" already uses ${existingAppliedDisjunctively ? "OR" : "AND"} logic. Cannot append ${logicType} rules — change the logic in Shopify Admin first or pick a different collection.`
           );
           continue;
         }
 
-        // Enrich existing PRODUCT_METAFIELD_DEFINITION rules with conditionObjectId
-        // because Shopify query does not return it, but collectionUpdate requires it.
-        const enrichedExistingRules = existingRules.map((rule) => ({ ...rule }));
-        const existingMetafieldRules = enrichedExistingRules.filter(
-          (r) => r.column === "PRODUCT_METAFIELD_DEFINITION"
-        );
-
-        if (existingMetafieldRules.length > 0) {
-          const historyConfig = await prisma.collectionRuleConfig.findFirst({
-            where: { shop, collectionId },
-          });
-
-          let knownDefIds = [];
-          if (historyConfig) {
-            const histLocIds = JSON.parse(historyConfig.locationIds || "[]");
-            const histLocations = await prisma.locationConfig.findMany({
-              where: { shop, locationId: { in: histLocIds } },
-            });
-            knownDefIds = histLocations
-              .map((l) => l.metafieldDefinitionId)
-              .filter((id) => id && String(id).startsWith("gid://"));
-          }
-
-          const allKnownDefIds = [...new Set([...knownDefIds])];
-
-          for (let i = 0; i < existingMetafieldRules.length; i++) {
-            if (allKnownDefIds[i]) {
-              existingMetafieldRules[i].conditionObjectId = allKnownDefIds[i];
-            } else {
+        // Reconstruct existing rules with conditionObjectId from conditionObject union.
+        // Non-metafield rules pass through unchanged.
+        const existingDefIds = new Set();
+        const preservedRules = [];
+        let collectionFailed = false;
+        for (const rule of existingRules) {
+          if (rule.column === "PRODUCT_METAFIELD_DEFINITION") {
+            const defId = rule.conditionObject?.metafieldDefinition?.id;
+            if (!defId) {
               errors.push(
-                `Collection "${collectionName}" has existing metafield rules with unknown definitions. Please remove them in Shopify Admin before adding new rules.`
+                `Collection "${collectionName}" has a metafield rule referencing a deleted definition. Please remove it in Shopify Admin first.`
               );
+              collectionFailed = true;
               break;
             }
+            existingDefIds.add(defId);
+            preservedRules.push({
+              column: rule.column,
+              relation: rule.relation,
+              condition: rule.condition,
+              conditionObjectId: defId,
+            });
+          } else {
+            preservedRules.push({
+              column: rule.column,
+              relation: rule.relation,
+              condition: rule.condition,
+            });
           }
-          if (errors.length > 0) continue;
         }
+        if (collectionFailed) continue;
 
-        const mergedRules = [...enrichedExistingRules, ...newRules];
-        console.log(`[Save] Collection "${collectionName}" mergedRules:`, JSON.stringify(mergedRules));
+        // Skip rules whose definition is already present (idempotent append).
+        const rulesToAppend = newRules.filter((r) => !existingDefIds.has(r.conditionObjectId));
+        const skippedCount = newRules.length - rulesToAppend.length;
 
-        await updateCollectionRules(admin, collectionId, mergedRules, appliedDisjunctively);
-        results.push(`Collection "${collectionName}": appended ${newRules.length} rule(s).`);
-
-        const existingConfig = await prisma.collectionRuleConfig.findFirst({
-          where: { shop, collectionId },
-        });
-
-        if (existingConfig) {
-          await prisma.collectionRuleConfig.update({
-            where: { id: existingConfig.id },
-            data: {
-              collectionName,
-              logicType,
-              threshold,
-              locationIds: JSON.stringify(locationIds),
-              isActive: true,
-              createdBy,
-            },
-          });
+        if (rulesToAppend.length === 0) {
+          results.push(`Collection "${collectionName}": all ${newRules.length} location rule(s) already present, no change.`);
         } else {
-          await prisma.collectionRuleConfig.create({
-            data: {
-              shop,
-              collectionId,
-              collectionName,
-              logicType,
-              threshold,
-              locationIds: JSON.stringify(locationIds),
-              isActive: true,
-              createdBy,
-            },
-          });
+          const mergedRules = [...preservedRules, ...rulesToAppend];
+          await updateCollectionRules(admin, collectionId, mergedRules, appliedDisjunctively);
+          const skippedNote = skippedCount > 0 ? ` (${skippedCount} already present, skipped)` : "";
+          results.push(`Collection "${collectionName}": appended ${rulesToAppend.length} rule(s)${skippedNote}.`);
         }
+
+        // Always create a fresh history row so users see the last 10 saves.
+        await prisma.collectionRuleConfig.create({
+          data: {
+            shop,
+            collectionId,
+            collectionName,
+            logicType,
+            threshold,
+            locationIds: JSON.stringify(locationIds),
+            isActive: true,
+            createdBy,
+          },
+        });
       }
 
       if (errors.length > 0) {
@@ -699,15 +861,11 @@ export const action = async ({ request }) => {
         }
       }
 
-      let inventorySync = null;
-      try {
-        inventorySync = await fullInventorySync(admin, shop);
-        await logDebug(shop, "smart-collection-sync", `Inventory backfill: scanned=${inventorySync.productsScanned}, metafields=${inventorySync.metafieldsWritten}`);
-      } catch (err) {
-        await logError(shop, "smart-collection-sync", `Inventory backfill failed: ${err.message}`);
-      }
+      // Inventory backfill is now a separate manual action — see
+      // "startInventorySync". Sync Locations only manages metafield definitions
+      // and the local locationConfig table.
 
-      return { success: true, synced: true, added, removed, inventorySync };
+      return { success: true, synced: true, added, removed };
     } catch (error) {
       console.error("[SmartCollection Action] Sync error:", error);
       return { error: error.message };
@@ -755,5 +913,153 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (actionType === "startInventorySync") {
+    try {
+      // Reject if a running job already exists for this shop.
+      const existing = await prisma.inventorySyncJob.findFirst({
+        where: { shop, status: "running" },
+        orderBy: { startedAt: "desc" },
+      });
+      if (existing) {
+        // Stale-job recovery: if a "running" row hasn't been updated for >5min,
+        // assume the previous server crashed and mark it failed.
+        const stale = Date.now() - new Date(existing.updatedAt).getTime() > 5 * 60 * 1000;
+        if (stale) {
+          await prisma.inventorySyncJob.update({
+            where: { id: existing.id },
+            data: {
+              status: "failed",
+              completedAt: new Date(),
+              errors: JSON.stringify([
+                ...(JSON.parse(existing.errors || "[]")),
+                "Job marked failed after 5 minutes of inactivity (server likely restarted).",
+              ]),
+            },
+          });
+        } else {
+          return { error: "An inventory sync is already running. Please wait for it to finish.", action: "startInventorySync" };
+        }
+      }
+
+      const { admin } = await authenticate.admin(request);
+      const totalProducts = await fetchProductsCount(admin);
+
+      const job = await prisma.inventorySyncJob.create({
+        data: { shop, status: "running", totalProducts },
+      });
+
+      // Fire-and-forget background runner. Uses unauthenticated.admin(shop)
+      // so it survives past the request lifecycle.
+      runInventorySyncJob(job.id, shop).catch(async (err) => {
+        try {
+          await prisma.inventorySyncJob.update({
+            where: { id: job.id },
+            data: {
+              status: "failed",
+              completedAt: new Date(),
+              errors: JSON.stringify([`Runner crashed: ${err?.message || String(err)}`]),
+            },
+          });
+        } catch (_) {
+          // ignore
+        }
+      });
+
+      return { success: true, jobStarted: true, jobId: job.id };
+    } catch (error) {
+      console.error("[SmartCollection Action] startInventorySync error:", error);
+      return { error: error.message, action: "startInventorySync" };
+    }
+  }
+
+  if (actionType === "getInventorySyncStatus") {
+    try {
+      const job = await prisma.inventorySyncJob.findFirst({
+        where: { shop },
+        orderBy: { startedAt: "desc" },
+      });
+      return { success: true, job };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  if (actionType === "cancelInventorySync") {
+    try {
+      const job = await prisma.inventorySyncJob.findFirst({
+        where: { shop, status: "running" },
+        orderBy: { startedAt: "desc" },
+      });
+      if (job) {
+        // Mark as cancelled — runner checks shouldStop() between pages.
+        await prisma.inventorySyncJob.update({
+          where: { id: job.id },
+          data: { status: "cancelled" },
+        });
+      }
+      return { success: true, cancelled: true };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
   return null;
 };
+
+/**
+ * Background runner for an InventorySyncJob. Polls own status row
+ * to detect cancellation, persists progress after every page.
+ */
+async function runInventorySyncJob(jobId, shop) {
+  const { admin } = await unauthenticated.admin(shop);
+
+  const result = await fullInventorySync(admin, shop, {
+    onProgress: async ({ productsScanned, metafieldsWritten, errors, cursor }) => {
+      await prisma.inventorySyncJob.update({
+        where: { id: jobId },
+        data: {
+          processedProducts: productsScanned,
+          metafieldsWritten,
+          cursor: cursor || null,
+          errors: JSON.stringify(errors || []),
+        },
+      });
+    },
+    shouldStop: async () => {
+      const row = await prisma.inventorySyncJob.findUnique({ where: { id: jobId } });
+      return row?.status === "cancelled";
+    },
+  });
+
+  // If we got here without being cancelled, mark completed (or failed if errors).
+  const current = await prisma.inventorySyncJob.findUnique({ where: { id: jobId } });
+  if (current?.status === "cancelled") {
+    await prisma.inventorySyncJob.update({
+      where: { id: jobId },
+      data: {
+        completedAt: new Date(),
+        processedProducts: result.productsScanned,
+        metafieldsWritten: result.metafieldsWritten,
+        errors: JSON.stringify(result.errors || []),
+      },
+    });
+    return;
+  }
+
+  await prisma.inventorySyncJob.update({
+    where: { id: jobId },
+    data: {
+      status: result.errors?.length > 0 ? "completed" : "completed",
+      completedAt: new Date(),
+      processedProducts: result.productsScanned,
+      metafieldsWritten: result.metafieldsWritten,
+      errors: JSON.stringify(result.errors || []),
+    },
+  });
+
+  await logDebug(
+    shop,
+    "inventory-sync-job",
+    `Job ${jobId} done: ${result.productsScanned} products, ${result.metafieldsWritten} metafields, ${result.errors?.length || 0} errors`
+  );
+}
